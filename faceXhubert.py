@@ -39,8 +39,8 @@ class FaceXHuBERT(nn.Module):
         self.dataset = args.dataset
         self.i_fps = args.input_fps # audio fps (input to the network)
         self.o_fps = args.output_fps # 4D Scan fps (output or target)
-        self.gru_layer_dim = 2
-        self.gru_hidden_dim = args.feature_dim
+        self.rnn_layer_dim = 2
+        self.rnn_hidden_dim = args.feature_dim
 
 
         # Audio Encoder
@@ -60,8 +60,8 @@ class FaceXHuBERT(nn.Module):
 
 
         #Vertex Decoder
-        # GRU module
-        self.gru = nn.GRU(self.audio_dim * 2, args.feature_dim, self.gru_layer_dim, batch_first=True, dropout=0.3)
+        # RNN module
+        self.rnn = nn.RNN(self.audio_dim * 2, args.feature_dim, self.rnn_layer_dim, batch_first=True, dropout=0.3)
 
         # Fully connected layer
         self.fc = nn.Linear(args.feature_dim, args.vertice_dim)
@@ -84,11 +84,11 @@ class FaceXHuBERT(nn.Module):
 
         hidden_states = hidden_states[:, :frame_num]
 
-        h0 = torch.zeros(self.gru_layer_dim, hidden_states.shape[0], self.gru_hidden_dim).requires_grad_().cuda()
+        h0 = torch.zeros(self.rnn_layer_dim, hidden_states.shape[0], self.rnn_hidden_dim).requires_grad_().cuda()
 
 
-        # GRU
-        vertice_out, _ = self.gru(hidden_states, h0)
+        # RNN
+        vertice_out, _ = self.rnn(hidden_states, h0)
         vertice_out = vertice_out * obj_embedding
         vertice_out = self.fc(vertice_out)
         vertice_out = vertice_out + template
@@ -106,10 +106,10 @@ class FaceXHuBERT(nn.Module):
         if hidden_states.shape[1] % 2 != 0:
             hidden_states = hidden_states[:, :hidden_states.shape[1]-1]
         hidden_states = torch.reshape(hidden_states, (1, hidden_states.shape[1] // 2, hidden_states.shape[2] * 2))
-        h0 = torch.zeros(self.gru_layer_dim, hidden_states.shape[0], self.gru_hidden_dim).requires_grad_().cuda()
+        h0 = torch.zeros(self.rnn_layer_dim, hidden_states.shape[0], self.rnn_hidden_dim).requires_grad_().cuda()
 
-        #GRU
-        vertice_out, _ = self.gru(hidden_states, h0)
+        #RNN
+        vertice_out, _ = self.rnn(hidden_states, h0)
         vertice_out = vertice_out * obj_embedding
         vertice_out = self.fc(vertice_out)
         vertice_out = vertice_out + template
