@@ -41,6 +41,8 @@ class FaceXHuBERT(nn.Module):
         self.o_fps = args.output_fps # 4D Scan fps (output or target)
         self.gru_layer_dim = 2
         self.gru_hidden_dim = args.feature_dim
+        self.lstm_layer_dim = 2
+        self.lstm_hidden_dim = args.feature_dim
 
 
         # Audio Encoder
@@ -61,7 +63,9 @@ class FaceXHuBERT(nn.Module):
 
         #Vertex Decoder
         # GRU module
-        self.gru = nn.GRU(self.audio_dim * 2, args.feature_dim, self.gru_layer_dim, batch_first=True, dropout=0.3)
+        # self.gru = nn.GRU(self.audio_dim * 2, args.feature_dim, self.gru_layer_dim, batch_first=True, dropout=0.3)
+        # LSTM module
+        self.lstm = nn.LSTM(self.audio_dim * 2, args.feature_dim, self.lstm_layer_dim, batch_first=True, dropout=0.3)
 
         # Fully connected layer
         self.fc = nn.Linear(args.feature_dim, args.vertice_dim)
@@ -84,11 +88,14 @@ class FaceXHuBERT(nn.Module):
 
         hidden_states = hidden_states[:, :frame_num]
 
-        h0 = torch.zeros(self.gru_layer_dim, hidden_states.shape[0], self.gru_hidden_dim).requires_grad_().cuda()
+        # h0 = torch.zeros(self.gru_layer_dim, hidden_states.shape[0], self.gru_hidden_dim).requires_grad_().cuda()
+        h0 = torch.zeros(self.lstm_layer_dim, hidden_states.shape[0], self.lstm_hidden_dim).requires_grad_().cuda()
+        c0 = torch.zeros(self.lstm_layer_dim, hidden_states.shape[0], self.lstm_hidden_dim).requires_grad_().cuda()
 
 
         # GRU
-        vertice_out, _ = self.gru(hidden_states, h0)
+        # vertice_out, _ = self.gru(hidden_states, h0)
+        vertice_out, (h_n, c_n) = self.lstm(hidden_states, (h0, c0))
         vertice_out = vertice_out * obj_embedding
         vertice_out = self.fc(vertice_out)
         vertice_out = vertice_out + template
