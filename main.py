@@ -7,10 +7,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-
+from torch.optim import Adam
 from data_loader import get_dataloaders
 from faceXhubert import FaceXHuBERT
-
+from torch.utils.data import DataLoader
 
 def plot_losses(train_losses, val_losses):
     plt.plot(train_losses, label="Training loss")
@@ -21,81 +21,56 @@ def plot_losses(train_losses, val_losses):
     plt.close()
 
 
-def trainer(args, train_loader, dev_loader, model, optimizer, criterion, epoch=100):
-    train_losses = []
-    val_losses = []
-
+def trainer(args, train_loader, valid_loader, model, optimizer, criterion, epoch):
     save_path = os.path.join(args.save_path)
     if os.path.exists(save_path):
         shutil.rmtree(save_path)
     os.makedirs(save_path)
 
-    train_subjects_list = [i for i in args.train_subjects.split(" ")]
-    iteration = 0
-    for e in range(epoch+1):
-        loss_log = []
+    for e in range(1, epoch + 1):
         model.train()
-        pbar = tqdm(enumerate(train_loader),total=len(train_loader))
-        optimizer.zero_grad()
-
-        for i, (audio, vertice, template, one_hot, file_name) in pbar:
-            iteration += 1
+        for i, (audio, vertice, template, one_hot, file_name) in enumerate(train_loader):
             vertice = str(vertice[0])
             vertice = np.load(vertice,allow_pickle=True)
             vertice = vertice.astype(np.float32)
             vertice = torch.from_numpy(vertice)
             vertice = torch.unsqueeze(vertice,0)
-            audio, vertice, template, one_hot = audio.to(device="cuda"), vertice.to(device="cuda"), template.to(device="cuda"), one_hot.to(device="cuda")
-            loss = model(audio, template,  vertice, one_hot, criterion)
+            audio, vertice, template, one_hot = (
+                audio.to(args.device),
+                vertice.to(args.device),
+                template.to(args.device),
+                one_hot.to(args.device),
+            )
+            optimizer.zero_grad()
+
+            vertice_out, loss = model(audio, template, vertice, one_hot, criterion, use_teacher_forcing=True)
 
             loss.backward()
-            loss_log.append(loss.item())
-            if i % args.gradient_accumulation_steps==0:
-                optimizer.step()
-                optimizer.zero_grad()
-                del audio, vertice, template, one_hot
-                torch.cuda.empty_cache()
+            optimizer.step()
 
-            pbar.set_description("(Epoch {}, iteration {}) TRAIN LOSS:{:.8f}".format((e+1), iteration ,np.mean(loss_log)))
-
-        train_losses.append(np.mean(loss_log))
-
-        valid_loss_log = []
-        model.eval()
-
-        for audio, vertice, template, one_hot_all, file_name in dev_loader:
-            # to gpu
-            vertice = str(vertice[0])
-            vertice = np.load(vertice, allow_pickle=True)
-            vertice = vertice.astype(np.float32)
-            vertice = torch.from_numpy(vertice)
-            vertice = torch.unsqueeze(vertice, 0)
-            audio, vertice, template, one_hot_all = audio.to(device="cuda"), vertice.to(device="cuda"), template.to(device="cuda"), one_hot_all.to(device="cuda")
-            train_subject = "_".join(file_name[0].split("_")[:-1])
-            if train_subject in train_subjects_list:
-                condition_subject = train_subject
-                iter = train_subjects_list.index(condition_subject)
-                one_hot = one_hot_all[:,iter,:]
-                loss = model(audio, template,  vertice, one_hot, criterion)
-                valid_loss_log.append(loss.item())
-            else:
-                for iter in range(one_hot_all.shape[-1]):
-                    condition_subject = train_subjects_list[iter]
-                    one_hot = one_hot_all[:,iter,:]
-                    loss = model(audio, template,  vertice, one_hot, criterion)
-                    valid_loss_log.append(loss.item())
-
-        current_loss = np.mean(valid_loss_log)
-
-        val_losses.append(current_loss)
-        if (e > 0 and e % 25 == 0) or e == args.max_epoch:
+            if i % 20 == 0:
+                print(f"Epoch [{e}], Step [{i}], Loss: {loss.item()}")
+        if e % 20 == 0:
             torch.save(model.state_dict(), os.path.join(save_path,'{}_model.pth'.format(e)))
-
-        print("epcoh: {}, current loss:{:.8f}".format(e+1,current_loss))
-
-    plot_losses(train_losses, val_losses)
-
-    return model
+            model.eval()
+            total_val_loss = 0.0
+            with torch.no_grad():
+                for audio, vertice, template, one_hot, _ in valid_loader:
+                    vertice = str(vertice[0])
+                    vertice = np.load(vertice,allow_pickle=True)
+                    vertice = vertice.astype(np.float32)
+                    vertice = torch.from_numpy(vertice)
+                    vertice = torch.unsqueeze(vertice,0)
+                    audio, vertice, template, one_hot = (
+                        audio.to(args.device),
+                        vertice.to(args.device),
+                        template.to(args.device),
+                        one_hot.to(args.device),
+                    )
+                    _, loss = model(audio, template, vertice, one_hot, criterion, use_teacher_forcing=False)
+                    total_val_loss += loss.item()
+            avg_val_loss = total_val_loss / len(valid_loader)
+            print(f"Epoch [{e}] Validation Loss: {avg_val_loss:.4f}")
 
 
 @torch.no_grad()
@@ -161,21 +136,15 @@ def main():
     parser.add_argument("--output_fps", type=int, default=30, help='fps of the visual data, multiface is available at 30 Hz')
     args = parser.parse_args()
 
-    model = FaceXHuBERT(args)
-    print("model parameters: ", count_parameters(model))
-
-    assert torch.cuda.is_available()
-
-    model = model.to(torch.device("cuda"))
     dataset = get_dataloaders(args)
-    criterion = nn.HuberLoss()
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad,model.parameters()), lr=args.lr)
+    train_loader = dataset["train"]
+    valid_loader = dataset["valid"]
 
-    model = trainer(args, dataset["train"], dataset["valid"],model, optimizer, criterion, epoch=args.max_epoch)
+    model = FaceXHuBERT(args).to(args.device)
+    optimizer = Adam(model.parameters(), lr=args.lr)
+    criterion = torch.nn.L1Loss()
 
-    test(args, model, dataset["test"], epoch=args.max_epoch)
-
-    print(model)
+    trainer(args, train_loader, valid_loader, model, optimizer, criterion, 100)
 
 
 if __name__ == "__main__":
