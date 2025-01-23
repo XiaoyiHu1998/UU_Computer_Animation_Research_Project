@@ -70,7 +70,7 @@ class Mamba(nn.Module):
     def forward(self, input_ids):
         """
         Args:
-            input_ids (long tensor): shape (b, l)    (See Glossary at top for definitions of b, l, d_in, n...)
+            input_ids (long tensor): shape (b -> batch size, l -> sequence length)    (See Glossary at top for definitions of b, l, d_in, n...)
 
         Returns:
             logits: shape (b, l, vocab_size)
@@ -106,18 +106,41 @@ class Mamba(nn.Module):
             model: Mamba model with weights loaded
 
         """
-        from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
-        from transformers.utils.hub import cached_file
+        # from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
+        # from transformers.utils.hub import cached_file
+        from transformers.file_utils import cached_path
+        from transformers.file_utils import hf_bucket_url
+
+        def cached_file_alt(model_name, file_name, _raise_exceptions_for_missing_entries=True):
+            """
+            **Added by B00tiam**
+            alternative of function cached_file in transformers.utils.hub
+            Args:
+                model_name:
+                file_name:
+                _raise_exceptions_for_missing_entries:
+
+            Returns:
+                Dictionary of cached file
+            """
+            file_url = hf_bucket_url(model_name, file_name)
+            try:
+                return cached_path(file_url)
+            except Exception:
+                if _raise_exceptions_for_missing_entries:
+                    raise Exception
+                return None
 
         def load_config_hf(model_name):
-            resolved_archive_file = cached_file(model_name, CONFIG_NAME,
+            resolved_archive_file = cached_file_alt(model_name, "config.json",
                                                 _raise_exceptions_for_missing_entries=False)
             return json.load(open(resolved_archive_file))
 
         def load_state_dict_hf(model_name, device=None, dtype=None):
-            resolved_archive_file = cached_file(model_name, WEIGHTS_NAME,
+            resolved_archive_file = cached_file_alt(model_name, "pytorch_model.bin",
                                                 _raise_exceptions_for_missing_entries=False)
-            return torch.load(resolved_archive_file, weights_only=True, map_location='cpu', mmap=True)
+            return torch.load(resolved_archive_file, map_location='cuda')
+            # return torch.load(resolved_archive_file, weights_only=True, map_location='cpu', mmap=True)
 
         config_data = load_config_hf(pretrained_model_name)
         args = ModelArgs(

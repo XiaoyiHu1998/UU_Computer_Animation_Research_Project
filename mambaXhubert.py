@@ -1,10 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 from hubert.modeling_hubert import HubertModel
-from mamba.mamba_mini.model import Mamba
-
+from mamba.mamba_mini.model import Mamba, ModelArgs
+import torch.nn.functional as F
 
 
 def inputRepresentationAdjustment(audio_embedding_matrix, vertex_matrix, ifps, ofps):
@@ -63,10 +61,11 @@ class FaceXHuBERT(nn.Module):
 
 
         #Vertex Decoder
-        # GRU module
-        # replaced as mamba ***
+        # GRU module --> mamba
+        self.mamba_args = ModelArgs(d_model=self.audio_dim * 2, n_layer=self.gru_layer_dim, vocab_size=2048)
+        self.mamba = Mamba(self.mamba_args)
         # self.gru = nn.GRU(self.audio_dim * 2, args.feature_dim, self.gru_layer_dim, batch_first=True, dropout=0.3)
-        self.mamba = Mamba(self.audio_dim * 2, args.feature_dim, self.gru_layer_dim, batch_first=True, dropout=0.3)
+
 
         # Fully connected layer
         self.fc = nn.Linear(args.feature_dim, args.vertice_dim)
@@ -92,13 +91,16 @@ class FaceXHuBERT(nn.Module):
         h0 = torch.zeros(self.gru_layer_dim, hidden_states.shape[0], self.gru_hidden_dim).requires_grad_().cuda()
 
 
-        # GRU
-        # replaced as mamba ***
+        # GRU --> mamba
         # vertice_out, _ = self.gru(hidden_states, h0)
-        vertice_out, _ = self.mamba(hidden_states, h0)
+        hidden_states = hidden_states.argmax(dim=-1)
+        vertice_out = self.mamba(hidden_states)
+        print(vertice_out.shape)
+        # *pooling
+        vertice_out = F.adaptive_max_pool1d(vertice_out, output_size=256)
+        print(vertice_out.shape)
+        # print(obj_embedding.shape)
         vertice_out = vertice_out * obj_embedding
-
-
         vertice_out = self.fc(vertice_out)
         vertice_out = vertice_out + template
 
@@ -118,11 +120,13 @@ class FaceXHuBERT(nn.Module):
         h0 = torch.zeros(self.gru_layer_dim, hidden_states.shape[0], self.gru_hidden_dim).requires_grad_().cuda()
 
         #GRU
-        # replaced as mamba ***
         # vertice_out, _ = self.gru(hidden_states, h0)
-        vertice_out, _ = self.mamba(hidden_states, h0)
-        vertice_out = vertice_out * obj_embedding
+        hidden_states = hidden_states.argmax(dim=-1)
+        vertice_out = self.mamba(hidden_states)
+        # *pooling
+        vertice_out = F.adaptive_max_pool1d(vertice_out, output_size=256)
 
+        vertice_out = vertice_out * obj_embedding
         vertice_out = self.fc(vertice_out)
         vertice_out = vertice_out + template
 
