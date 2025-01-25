@@ -31,80 +31,93 @@ def inputRepresentationAdjustment(audio_embedding_matrix, vertex_matrix, ifps, o
 class FaceXHuBERT(nn.Module):
     def __init__(self, args):
         super(FaceXHuBERT, self).__init__()
-        
-        self.i_fps = args.input_fps  
-        self.o_fps = args.output_fps  
+        """
+        - audio: (batch_size, raw_wav)
+        - template: (batch_size, V*3)
+        - vertice: (batch_size, seq_len, V*3)
+        """
+        self.dataset = args.dataset
+        self.input_fps = args.input_fps
+        self.output_fps = args.output_fps
+        self.gru_layers = 2
+        self.gru_hidden_dim = args.feature_dim 
 
         self.audio_encoder = HubertModel.from_pretrained("facebook/hubert-base-ls960")
-        self.audio_dim = self.audio_encoder.config.hidden_size
+        self.audio_feature_dim = self.audio_encoder.encoder.config.hidden_size
+        self.audio_encoder.feature_extractor._freeze_parameters()
 
-        self.gru_layer_dim = 2
-        self.gru_hidden_dim = args.feature_dim
-        self.gru = nn.GRU(self.audio_dim + self.audio_dim, self.gru_hidden_dim, self.gru_layer_dim, batch_first=True, dropout=0.3)
+        frozen_layers = [0, 1]
+        for name, param in self.audio_encoder.named_parameters():
+            if name.startswith("feature_projection"):
+                param.requires_grad = False
+            if name.startswith("encoder.layers"):
+                layer_idx = int(name.split(".")[2])
+                if layer_idx in frozen_layers:
+                    param.requires_grad = False
+
+        self.gru = nn.GRU(
+            input_size=self.audio_feature_dim * 2, 
+            hidden_size=self.gru_hidden_dim,
+            num_layers=self.gru_layers,
+            batch_first=True,
+            dropout=0.3
+        )
 
         self.fc = nn.Linear(self.gru_hidden_dim, args.vertice_dim)
+        nn.init.constant_(self.fc.weight, 0)
+        nn.init.constant_(self.fc.bias, 0)
 
-        self.vertice_dim_reducer = nn.Linear(args.vertice_dim, self.audio_dim)
+        num_subjects = len(args.train_subjects.split())
+        self.subject_embedding = nn.Linear(num_subjects, self.gru_hidden_dim, bias=False)
 
-        self.obj_vector = nn.Linear(len(args.train_subjects.split()), args.feature_dim, bias=False)
+    def forward(self, audio_input, template_vertices, target_vertices, one_hot_subject, loss_fn):
+        template_vertices = template_vertices.unsqueeze(1)  # (batch_size, 1, V*3)
+        subject_embedding = self.subject_embedding(one_hot_subject)  # (batch_size, feature_dim)
+        audio_features = self.audio_encoder(audio_input).last_hidden_state  # (batch_size, seq_len, audio_feature_dim)
+        audio_features, target_vertices, num_frames = inputRepresentationAdjustment(
+            audio_features, target_vertices, self.input_fps, self.output_fps
+        )
+        audio_features = audio_features[:, :num_frames] 
+        batch_size = audio_features.size(0)
+        initial_hidden_state = torch.zeros(
+            self.gru_layers, batch_size, self.gru_hidden_dim
+        ).requires_grad_().to(audio_features.device)
 
+        gru_output, _ = self.gru(audio_features, initial_hidden_state)  # (batch_size, seq_len, hidden_dim)
 
-    def forward(self, audio, template, vertice, one_hot, criterion, use_teacher_forcing=True):
-        template = template.unsqueeze(1)
-        current_vertice = self.vertice_dim_reducer(template)
-    
-        hidden_states = self.audio_encoder(audio).last_hidden_state
-        frame_num = min(hidden_states.shape[1], vertice.shape[1])
-    
-        if frame_num == 0:
-            raise ValueError("Frame_num is zero after adjustment. Check input data.")
-    
-        hidden_states = hidden_states[:, :frame_num, :]
-        vertice = vertice[:, :frame_num, :]
-    
-        h0 = torch.zeros(self.gru_layer_dim, hidden_states.shape[0], self.gru_hidden_dim).to(audio.device)
-        vertice_out = []
-        loss = 0.0
-    
-        for t in range(frame_num):
-            current_audio_feature = hidden_states[:, t:t+1, :]
-            gru_input = torch.cat([current_audio_feature, current_vertice], dim=-1)
-    
-            vertice_pred, h0 = self.gru(gru_input, h0)
-            vertice_pred = self.fc(vertice_pred.squeeze(1))
-    
-            loss += criterion(vertice_pred, vertice[:, t, :])
-    
-            if use_teacher_forcing and torch.rand(1).item() < 0.5:
-                current_vertice = self.vertice_dim_reducer(vertice[:, t:t+1, :])
-            else:
-                current_vertice = self.vertice_dim_reducer(vertice_pred.unsqueeze(1))
-    
-            vertice_out.append(vertice_pred.unsqueeze(1))
-    
-        vertice_out = torch.cat(vertice_out, dim=1)
-        loss = loss / frame_num
-        return vertice_out, loss
+        gru_output = gru_output * subject_embedding.unsqueeze(1)
 
+        predicted_vertices = self.fc(gru_output)  # (batch_size, seq_len, V*3)
+        predicted_vertices = predicted_vertices + template_vertices
 
-    def predict(self, audio, template, one_hot):
-        template = template.unsqueeze(1)  
-        obj_embedding = self.obj_vector(one_hot) 
-        current_vertice = self.vertice_dim_reducer(template) 
-    
-        hidden_states = self.audio_encoder(audio).last_hidden_state
-        frame_num = hidden_states.shape[1]
-        h0 = torch.zeros(self.gru_layer_dim, hidden_states.shape[0], self.gru_hidden_dim).to(audio.device)
-    
-        vertice_out = []
-    
-        for t in range(frame_num):
-            current_audio_feature = hidden_states[:, t:t+1, :]
-            gru_input = torch.cat([current_audio_feature, current_vertice], dim=-1)
-            vertice_pred, h0 = self.gru(gru_input, h0)
-            vertice_pred = self.fc(vertice_pred.squeeze(1))
-            current_vertice = self.vertice_dim_reducer(vertice_pred.unsqueeze(1))
-            vertice_out.append(vertice_pred.unsqueeze(1))
-    
-        vertice_out = torch.cat(vertice_out, dim=1)
-        return vertice_out
+        loss = loss_fn(predicted_vertices, target_vertices)
+        return torch.mean(loss)
+
+    def predict(self, audio_input, template_vertices, one_hot_subject):
+        """
+        - audio_input: (batch_size, raw_wav)
+        - template_vertices: (batch_size, V*3)
+        - one_hot_subject: (batch_size, num_subjects)
+        - predicted_vertices: (batch_size, seq_len, V*3)
+        """
+        template_vertices = template_vertices.unsqueeze(1)  # (batch_size, 1, V*3)
+        subject_embedding = self.subject_embedding(one_hot_subject)  # (batch_size, feature_dim)
+
+        audio_features = self.audio_encoder(audio_input).last_hidden_state
+
+        if audio_features.size(1) % 2 != 0:
+            audio_features = audio_features[:, :-1]
+        audio_features = audio_features.view(1, audio_features.size(1) // 2, audio_features.size(2) * 2)
+
+        batch_size = audio_features.size(0)
+        initial_hidden_state = torch.zeros(
+            self.gru_layers, batch_size, self.gru_hidden_dim
+        ).requires_grad_().to(audio_features.device)
+        gru_output, _ = self.gru(audio_features, initial_hidden_state)
+
+        gru_output = gru_output * subject_embedding.unsqueeze(1)
+
+        predicted_vertices = self.fc(gru_output)  # (batch_size, seq_len, V*3)
+        predicted_vertices = predicted_vertices + template_vertices 
+
+        return predicted_vertices
