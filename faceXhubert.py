@@ -63,6 +63,7 @@ class FaceXHuBERT(nn.Module):
             dropout=0.3
         )
 
+        self.attention = nn.MultiheadAttention(embed_dim=self.hidden_state_dim, num_heads=4, batch_first=True)
         self.output_layer = nn.Linear(self.hidden_state_dim, args.vertice_dim)
         nn.init.constant_(self.output_layer.weight, 0)
         nn.init.constant_(self.output_layer.bias, 0)
