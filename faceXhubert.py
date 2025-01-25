@@ -27,89 +27,102 @@ def inputRepresentationAdjustment(audio_embedding_matrix, vertex_matrix, ifps, o
 
     return audio_embedding_matrix, vertex_matrix, frame_num
 
+
 class FaceXHuBERT(nn.Module):
     def __init__(self, args):
         super(FaceXHuBERT, self).__init__()
+        """
+        audio: (batch_size, raw_wav)
+        template: (batch_size, V*3)
+        vertice: (batch_size, seq_len, V*3)
+        """
+        self.dataset_name = args.dataset
+        self.input_frame_rate = args.input_fps
+        self.output_frame_rate = args.output_fps
+        self.num_gru_layers = 2
+        self.hidden_state_dim = args.feature_dim 
 
-        self.audio_encoder = HubertModel.from_pretrained("facebook/hubert-base-ls960")
-        self.audio_dim = self.audio_encoder.config.hidden_size  # 768
+        self.audio_feature_extractor = HubertModel.from_pretrained("facebook/hubert-base-ls960")
+        self.audio_embedding_dim = self.audio_feature_extractor.encoder.config.hidden_size
+        self.audio_feature_extractor.feature_extractor._freeze_parameters()
 
-        self.gru_layer_dim = 2
-        self.gru_hidden_dim = args.feature_dim
-        self.decoder_gru = nn.GRU(self.gru_hidden_dim, self.gru_hidden_dim, self.gru_layer_dim, batch_first=True, dropout=0.3)
+        frozen_layers_indices = [0, 1]
+        for param_name, param_value in self.audio_feature_extractor.named_parameters():
+            if param_name.startswith("feature_projection"):
+                param_value.requires_grad = False
+            if param_name.startswith("encoder.layers"):
+                layer_number = int(param_name.split(".")[2])
+                if layer_number in frozen_layers_indices:
+                    param_value.requires_grad = False
 
-        self.fc = nn.Linear(self.gru_hidden_dim, args.vertice_dim)
+        self.gru_module = nn.GRU(
+            input_size=self.audio_embedding_dim * 2, 
+            hidden_size=self.hidden_state_dim,
+            num_layers=self.num_gru_layers,
+            batch_first=True,
+            dropout=0.3
+        )
 
-        self.vertice_to_hidden = nn.Linear(args.vertice_dim, self.gru_hidden_dim)
+        self.output_layer = nn.Linear(self.hidden_state_dim, args.vertice_dim)
+        nn.init.constant_(self.output_layer.weight, 0)
+        nn.init.constant_(self.output_layer.bias, 0)
 
-        self.attention = nn.Linear(self.gru_hidden_dim * 2, self.audio_dim)
-        self.context_layer = nn.Linear(self.audio_dim, self.gru_hidden_dim)
+        subject_count = len(args.train_subjects.split())
+        self.subject_embedding_layer = nn.Linear(subject_count, self.hidden_state_dim, bias=False)
 
-    def forward(self, audio, template, vertice, one_hot, criterion, use_teacher_forcing=True):
-        encoder_outputs = self.audio_encoder(audio).last_hidden_state
-        batch_size, seq_len, _ = encoder_outputs.shape
+    def forward(self, audio_input, base_template, target_sequence, subject_one_hot, loss_function):
+        base_template = base_template.unsqueeze(1)  # (batch_size, 1, V*3)
+        subject_features = self.subject_embedding_layer(subject_one_hot)  # (batch_size, feature_dim)
+        extracted_audio_features = self.audio_feature_extractor(audio_input).last_hidden_state  # (batch_size, seq_len, audio_feature_dim)
+        
+        adjusted_audio, adjusted_targets, frame_count = inputRepresentationAdjustment(
+            extracted_audio_features, target_sequence, self.input_frame_rate, self.output_frame_rate
+        )
+        adjusted_audio = adjusted_audio[:, :frame_count] 
+        batch_count = adjusted_audio.size(0)
+        
+        initial_states = torch.zeros(
+            self.num_gru_layers, batch_count, self.hidden_state_dim
+        ).requires_grad_().to(adjusted_audio.device)
 
-        min_frame_num = min(seq_len, vertice.shape[1])
-        encoder_outputs = encoder_outputs[:, :min_frame_num, :]
-        vertice = vertice[:, :min_frame_num, :]
+        rnn_output, _ = self.gru_module(adjusted_audio, initial_states)  # (batch_size, seq_len, hidden_dim)
 
-        decoder_hidden = torch.zeros(self.gru_layer_dim, batch_size, self.gru_hidden_dim).to(audio.device)
-        current_vertice = template.unsqueeze(1)
+        rnn_output = rnn_output * subject_features.unsqueeze(1)
 
-        predictions = []
-        loss = 0.0
+        output_vertices = self.output_layer(rnn_output)  # (batch_size, seq_len, V*3)
+        output_vertices = output_vertices + base_template
 
-        for t in range(min_frame_num):
-            context_vector = encoder_outputs[:, t:t+1, :] 
+        computed_loss = loss_function(output_vertices, target_sequence)
+        return torch.mean(computed_loss)
 
-            vertice_feature = self.vertice_to_hidden(current_vertice.squeeze(1))
+    def predict(self, audio_input, base_template, subject_one_hot):
+        """
+        - audio_input: (batch_size, raw_wav)
+        - base_template: (batch_size, V*3)
+        - subject_one_hot: (batch_size, num_subjects)
+        - predicted_sequence: (batch_size, seq_len, V*3)
+        """
+        base_template = base_template.unsqueeze(1)  # (batch_size, 1, V*3)
+        subject_features = self.subject_embedding_layer(subject_one_hot)  # (batch_size, feature_dim)
 
-            attention_input = torch.cat([vertice_feature, decoder_hidden[-1]], dim=-1)
-            context_vector = self.attention(attention_input)
-            context_vector = self.context_layer(context_vector.unsqueeze(1))
+        extracted_audio_features = self.audio_feature_extractor(audio_input).last_hidden_state
 
-            decoder_input = context_vector
-            output, decoder_hidden = self.decoder_gru(decoder_input, decoder_hidden)  
+        if extracted_audio_features.size(1) % 2 != 0:
+            extracted_audio_features = extracted_audio_features[:, :-1]
+        reshaped_audio = extracted_audio_features.view(
+            1, extracted_audio_features.size(1) // 2, extracted_audio_features.size(2) * 2
+        )
 
-            vertice_pred = self.fc(output.squeeze(1))
+        batch_count = reshaped_audio.size(0)
+        initial_states = torch.zeros(
+            self.num_gru_layers, batch_count, self.hidden_state_dim
+        ).requires_grad_().to(reshaped_audio.device)
 
-            loss += criterion(vertice_pred, vertice[:, t, :])
+        rnn_output, _ = self.gru_module(reshaped_audio, initial_states)
 
-            if use_teacher_forcing and torch.rand(1).item() < 0.5:
-                current_vertice = vertice[:, t:t+1, :]
-            else:
-                current_vertice = vertice_pred.unsqueeze(1)
+        rnn_output = rnn_output * subject_features.unsqueeze(1)
 
-            predictions.append(vertice_pred.unsqueeze(1))
+        predicted_sequence = self.output_layer(rnn_output)  # (batch_size, seq_len, V*3)
+        predicted_sequence = predicted_sequence + base_template 
 
-        predictions = torch.cat(predictions, dim=1)
-        loss = loss / min_frame_num
-        return predictions, loss
-
-
-    def predict(self, audio, template, one_hot):
-        encoder_outputs = self.audio_encoder(audio).last_hidden_state
-        batch_size, seq_len, _ = encoder_outputs.shape
-    
-        decoder_hidden = torch.zeros(self.gru_layer_dim, batch_size, self.gru_hidden_dim).to(audio.device)
-        current_vertice = template.unsqueeze(1)
-    
-        predictions = []
-    
-        for t in range(seq_len):
-            if hasattr(self, "attention"):
-                context_vector = self.attention(torch.cat([current_vertice.squeeze(1), decoder_hidden[-1]], dim=-1))
-                context_vector = self.context_layer(context_vector.unsqueeze(1))
-            else:
-                context_vector = encoder_outputs[:, t:t+1, :]
-    
-            decoder_input = context_vector
-    
-            output, decoder_hidden = self.decoder_gru(decoder_input, decoder_hidden)
-            vertice_pred = self.fc(output.squeeze(1))
-            current_vertice = vertice_pred.unsqueeze(1)
-    
-            predictions.append(vertice_pred.unsqueeze(1))
-    
-        predictions = torch.cat(predictions, dim=1)
-        return predictions
+        return predicted_sequence
