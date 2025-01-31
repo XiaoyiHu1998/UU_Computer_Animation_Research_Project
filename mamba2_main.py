@@ -9,7 +9,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from data_loader import get_dataloaders
-from mambaXhubert import FaceXHuBERT
+from mamba2Xhubert import FaceXHuBERT
 
 
 def plot_losses(train_losses, val_losses):

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from hubert.modeling_hubert import HubertModel
-from mamba.mamba_mini.model import Mamba, ModelArgs
+from mamba.mamba2_mini.model import Mamba2, Mamba2Config
 import torch.nn.functional as F
 
 
@@ -63,8 +63,8 @@ class FaceXHuBERT(nn.Module):
         #Vertex Decoder
         # GRU module --> mamba
         self.mamba_pool_out = args.m_pool_out
-        self.mamba_args = ModelArgs(d_model=self.audio_dim * 2, n_layer=self.gru_layer_dim, vocab_size=2000)
-        self.mamba = Mamba(self.mamba_args)
+        self.mamba_args = Mamba2Config(d_model=self.audio_dim * 2, n_layer=self.gru_layer_dim, vocab_size=2000, chunk_size=64)
+        self.mamba = Mamba2(self.mamba_args)
         # self.mamba = Mamba.from_pretrained('state-spaces/mamba-370m')
         # self.gru = nn.GRU(self.audio_dim * 2, args.feature_dim, self.gru_layer_dim, batch_first=True, dropout=0.3)
         # Linear mapping layer (for dimensionality reduction)
@@ -93,12 +93,12 @@ class FaceXHuBERT(nn.Module):
         hidden_states = hidden_states[:, :frame_num]
 
         h0 = torch.zeros(self.gru_layer_dim, hidden_states.shape[0], self.gru_hidden_dim).requires_grad_().cuda()
-
+        # print("ver has NaN:", torch.isnan(vertice).any())
 
         # GRU --> mamba
         # vertice_out, _ = self.gru(hidden_states, h0)
-        hidden_states = hidden_states.argmax(dim=-1)
-        vertice_out = self.mamba(hidden_states)
+
+        vertice_out, _ = self.mamba(hidden_states)
 
         # *pooling
         vertice_out = F.adaptive_max_pool1d(vertice_out, output_size=self.mamba_pool_out)
@@ -127,8 +127,8 @@ class FaceXHuBERT(nn.Module):
 
         #GRU
         # vertice_out, _ = self.gru(hidden_states, h0)
-        hidden_states = hidden_states.argmax(dim=-1)
-        vertice_out = self.mamba(hidden_states)
+        vertice_out, _ = self.mamba(hidden_states)
+
         # *pooling
         vertice_out = F.adaptive_max_pool1d(vertice_out, output_size=self.mamba_pool_out)
         # *mapping
